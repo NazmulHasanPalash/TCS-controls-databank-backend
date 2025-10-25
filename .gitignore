@@ -1,6 +1,8 @@
-﻿node_modules
+﻿/node_modules
 .env
+.env.*
 serviceAccount.json
 uploads/
-
-.vercel
+tmp/
+logs/
+*.log
