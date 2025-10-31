@@ -4,7 +4,7 @@
 // Exports:
 //   - requireAuth(req,res,next)
 //   - requireRole(allowedRoles)(req,res,next)
-//   - minRole(minRoleName)(req,res,next)         // use minRole('user') for the lowest gate (aka “normal user”)
+//   - minRole(minRoleName)(req,res,next)   // e.g. minRole('user') / 'operator' / 'moderator' / 'admin'
 //   - setUserRole(uid, role)
 //   - getUserRole(uid)
 //   - ROLE_ORDER
@@ -14,28 +14,29 @@
 //   Doc ID: <uid>
 //   Fields:
 //     role: "admin" | "moderator" | "operator" | "user"
-//     updatedAt: <number ms since epoch>
+//     updatedAt: <number ms since epoch or Firestore Timestamp>
 //
 // Notes:
-//   * If no user doc exists or role is missing, user defaults to the lowest level (“user”).
-//   * Role values are normalized to lowercase.
-//   * For backward compatibility, "operator" is treated the same as "user" (lowest level).
-//   * This module depends only on firebase-admin.
+//   * If a user doc or role is missing, default to "user" (lowest).
+//   * Requires firebase-admin to be initialized in ./firebase-admin.
+//   * If you want to read a token from a cookie, make sure your app uses cookie-parser:
+//       const cookieParser = require('cookie-parser');
+//       app.use(cookieParser());
 
 'use strict';
 
-const { admin } = require('./firebase-admin'); // ✅ MUST match your firebase-admin.js export
+const { admin } = require('./firebase-admin'); // Initialized Admin SDK
 const db = admin.firestore();
 
-/** Display order (for reference only). */
+/** Display order (for reference/UI only). */
 const ROLE_ORDER = ['user', 'operator', 'moderator', 'admin'];
 
-/** Internal comparable levels — "user" and "operator" are equivalent (lowest). */
+/** Comparable levels (higher number = higher privilege). */
 const ROLE_LEVEL = {
   user: 0,
-  operator: 0, // ← compatibility alias for lowest level
-  moderator: 1,
-  admin: 2,
+  operator: 1,
+  moderator: 2,
+  admin: 3,
 };
 
 // Small in-memory cache to reduce Firestore reads
@@ -43,10 +44,11 @@ const roleCache = new Map(); // key: uid → { role, ts }
 const ROLE_TTL_MS = 60 * 1000; // 1 minute
 
 /* -------------------------------- Utilities -------------------------------- */
+
 const now = () => Date.now();
 
 function normalizeRole(value) {
-  return String(value || '')
+  return String(value ?? '')
     .trim()
     .toLowerCase();
 }
@@ -76,12 +78,12 @@ function setCache(uid, role) {
 
 /** Extract Bearer token from Authorization header or __session cookie. */
 function extractIdToken(req) {
-  const authHeader = req.headers?.authorization;
+  const authHeader = req.headers && req.headers.authorization;
   if (authHeader && typeof authHeader === 'string') {
     const m = authHeader.match(/^Bearer\s+(.+)$/i);
     if (m) return m[1];
   }
-  // Optional cookie fallback (if you set it on the client)
+  // Optional cookie fallback (requires cookie-parser upstream)
   if (req.cookies && typeof req.cookies.__session === 'string') {
     return req.cookies.__session;
   }
@@ -100,7 +102,7 @@ async function requireAuth(req, res, next) {
       return res.status(401).json({ ok: false, error: 'Missing Bearer token' });
     }
 
-    // Verify token with Admin SDK
+    // Verify token with Admin SDK (second arg true checks revocation)
     const decoded = await admin.auth().verifyIdToken(idToken, true);
     req.user = { uid: decoded.uid, email: decoded.email || null };
 
@@ -123,7 +125,6 @@ async function getUserRole(uid) {
   const snap = await db.collection('users').doc(uid).get();
   const roleRaw = snap.exists ? snap.data().role : null;
 
-  // Default to lowest level; accept both "user" and legacy "operator"
   let role = normalizeRole(roleRaw || 'user');
   if (!isAllowedRole(role)) role = 'user';
 
@@ -131,7 +132,7 @@ async function getUserRole(uid) {
   return role;
 }
 
-/** requireRole([...roles]) — only allows if user role is exactly one of the list. */
+/** requireRole([...roles]) — allows only if user role is exactly one of the list. */
 function requireRole(allowedRoles = []) {
   const allowedList = (
     Array.isArray(allowedRoles) ? allowedRoles : [allowedRoles]
@@ -142,7 +143,7 @@ function requireRole(allowedRoles = []) {
 
   return async (req, res, next) => {
     try {
-      if (!req.user?.uid) {
+      if (!req.user || !req.user.uid) {
         return res.status(401).json({ ok: false, error: 'Unauthenticated' });
       }
       const role = await getUserRole(req.user.uid);
@@ -161,7 +162,8 @@ function requireRole(allowedRoles = []) {
 }
 
 /**
- * minRole('user') → allows user/operator, moderator, admin (>=).
+ * minRole('user') → allows user, operator, moderator, admin (>=).
+ * minRole('operator') → allows operator, moderator, admin.
  * minRole('moderator') → allows moderator, admin.
  * minRole('admin') → allows admin only.
  */
@@ -174,7 +176,7 @@ function minRole(min) {
 
   return async (req, res, next) => {
     try {
-      if (!req.user?.uid) {
+      if (!req.user || !req.user.uid) {
         return res.status(401).json({ ok: false, error: 'Unauthenticated' });
       }
       const role = await getUserRole(req.user.uid);
@@ -218,7 +220,7 @@ async function setUserRole(uid, role) {
 module.exports = {
   requireAuth,
   requireRole,
-  minRole, // use as minRole('user') where you want the normal-user gate
+  minRole, // use as minRole('operator') / 'moderator' / 'admin' where needed
   setUserRole,
   getUserRole,
   ROLE_ORDER,
