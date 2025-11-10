@@ -4,7 +4,6 @@
  * tcsdatabank-server (Local Disk + MySQL metadata/audit)
  * Public (no-login) endpoints for listing, creating folders/files, uploading,
  * downloading, zipping — and also RENAMING and DELETING (no auth).
- * Admin-only stuff stays under /api/admin via your adminRouter.
  */
 
 require('dotenv').config();
@@ -19,50 +18,56 @@ const fs = require('fs');
 const fsp = fs.promises;
 const os = require('os');
 const cookieParser = require('cookie-parser');
-const { PassThrough } = require('stream');
 const archiver = require('archiver');
 const { randomUUID, createHash } = require('crypto');
 const mysql = require('mysql2/promise');
 
-// Admin router only (kept behind /api/admin)
-const adminRouter = require('./admin-routes');
+/* -------------------- Admin router (optional) -------------------- */
+let adminRouter = (_req, _res, next) => next();
+try {
+  if (fs.existsSync(path.join(__dirname, 'admin-routes.js'))) {
+    // eslint-disable-next-line global-require
+    adminRouter = require('./admin-routes');
+  }
+} catch {
+  /* noop */
+}
 
 const app = express();
-app.disable('x-powered-by'); // small hardening
+app.disable('x-powered-by');
 
 /* -------------------- ENV -------------------- */
 const {
   // Server
-  PORT = 5000,
+  PORT = process.env.PORT || 5000,
   CORS_ORIGINS,
-  BODY_LIMIT = '2gb',
-  FILE_SIZE_LIMIT = '2gb',
-  FIELD_SIZE_LIMIT = '512mb',
-  FILES_LIMIT = '1000',
-  FIELDS_LIMIT = '5000',
-  PARTS_LIMIT = '10000',
+  // Defaults (override via env if you want stricter)
+  BODY_LIMIT = '20gb',
+  FILE_SIZE_LIMIT = '20gb',
+  FIELD_SIZE_LIMIT = '1gb',
+  FILES_LIMIT = '100000',
+  FIELDS_LIMIT = '200000',
+  PARTS_LIMIT = '300000',
+
   // Cookies
   COOKIE_SECRET,
-
-  // Storage (local disk)
+  // Storage
   STORAGE_BASE,
-
+  UPLOAD_TMP_DIR, // optional
   // DB
   DB_HOST,
   DB_PORT,
   DB_NAME,
   DB_USER,
   DB_PASS,
-  DB_CONN_LIMIT = '10',
+  DB_CONN_LIMIT = '15',
 } = process.env;
 
-if (!STORAGE_BASE) {
-  console.error('❌ Missing STORAGE_BASE in .env (absolute path required)');
-  process.exit(1);
-}
-if (!DB_HOST || !DB_NAME || !DB_USER || !DB_PASS) {
-  console.error('❌ Missing DB_* env vars (DB_HOST/DB_NAME/DB_USER/DB_PASS)');
-  process.exit(1);
+const missingEnv = [];
+if (!STORAGE_BASE) missingEnv.push('STORAGE_BASE');
+if (!DB_HOST || !DB_NAME || !DB_USER || !DB_PASS) missingEnv.push('DB_*');
+if (missingEnv.length) {
+  console.error('⚠️ Missing env vars:', missingEnv.join(', '));
 }
 
 /* -------------------- DB POOL -------------------- */
@@ -71,7 +76,7 @@ function getPool() {
   if (!DB_POOL) {
     DB_POOL = mysql.createPool({
       host: DB_HOST,
-      port: Number(DB_PORT),
+      port: DB_PORT ? Number(DB_PORT) : undefined,
       database: DB_NAME,
       user: DB_USER,
       password: DB_PASS,
@@ -83,7 +88,7 @@ function getPool() {
   return DB_POOL;
 }
 
-/* -------------------- HELPERS (sizes) -------------------- */
+/* -------------------- HELPERS -------------------- */
 function parseSize(str) {
   if (typeof str === 'number') return str;
   const m = String(str || '')
@@ -98,26 +103,171 @@ function parseSize(str) {
   return Math.floor(n * mul);
 }
 
+/** Cross-device safe move: try rename; on EXDEV/EPERM fall back to fast stream copy + unlink */
+async function safeMove(src, dest) {
+  try {
+    await fsp.rename(src, dest);
+    return;
+  } catch (err) {
+    if (err && (err.code === 'EXDEV' || err.code === 'EPERM')) {
+      await fsp.mkdir(path.dirname(dest), { recursive: true });
+      await new Promise((resolve, reject) => {
+        const rs = fs.createReadStream(src, { highWaterMark: 8 * 1024 * 1024 });
+        const ws = fs.createWriteStream(dest);
+        rs.on('error', reject);
+        ws.on('error', reject);
+        ws.on('close', resolve);
+        rs.pipe(ws);
+      });
+      await fsp.unlink(src).catch(() => {});
+      return;
+    }
+    throw err;
+  }
+}
+
+/* -------------------- MIME HELPER -------------------- */
+function guessContentType(filename = '') {
+  const ext = String(filename).split('.').pop().toLowerCase();
+
+  // Images
+  if (['png'].includes(ext)) return 'image/png';
+  if (['jpg', 'jpeg', 'jpe'].includes(ext)) return 'image/jpeg';
+  if (['gif'].includes(ext)) return 'image/gif';
+  if (['webp'].includes(ext)) return 'image/webp';
+  if (['bmp'].includes(ext)) return 'image/bmp';
+  if (['tif', 'tiff'].includes(ext)) return 'image/tiff';
+  if (['ico'].includes(ext)) return 'image/x-icon';
+  if (['svg'].includes(ext)) return 'image/svg+xml';
+
+  // Video
+  if (['mp4', 'm4v'].includes(ext)) return 'video/mp4';
+  if (['webm'].includes(ext)) return 'video/webm';
+  if (['ogv'].includes(ext)) return 'video/ogg';
+  if (['mov'].includes(ext)) return 'video/quicktime';
+  if (['mkv'].includes(ext)) return 'video/x-matroska';
+  if (['3gp'].includes(ext)) return 'video/3gpp';
+
+  // Audio
+  if (['mp3'].includes(ext)) return 'audio/mpeg';
+  if (['wav'].includes(ext)) return 'audio/wav';
+  if (['ogg'].includes(ext)) return 'audio/ogg';
+  if (['m4a', 'aac'].includes(ext)) return 'audio/aac';
+  if (['flac'].includes(ext)) return 'audio/flac';
+
+  // Docs
+  if (ext === 'pdf') return 'application/pdf';
+  if (['txt', 'log'].includes(ext)) return 'text/plain; charset=utf-8';
+  if (ext === 'md') return 'text/markdown; charset=utf-8';
+  if (ext === 'html' || ext === 'htm') return 'text/html; charset=utf-8';
+  if (ext === 'css') return 'text/css; charset=utf-8';
+  if (ext === 'js') return 'application/javascript; charset=utf-8';
+  if (ext === 'json') return 'application/json; charset=utf-8';
+  if (ext === 'xml') return 'application/xml; charset=utf-8';
+  if (ext === 'csv') return 'text/csv; charset=utf-8';
+
+  // Office
+  if (ext === 'doc') return 'application/msword';
+  if (ext === 'docx')
+    return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  if (ext === 'xls') return 'application/vnd.ms-excel';
+  if (ext === 'xlsx')
+    return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  if (ext === 'ppt') return 'application/vnd.ms-powerpoint';
+  if (ext === 'pptx')
+    return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+
+  // Fallback
+  return 'application/octet-stream';
+}
+
+/* -------------------- SMART FILE SENDER -------------------- */
+function getDisposition(req) {
+  const q = req.query || {};
+  const disp =
+    (q.disposition || q.disp || '').toString().toLowerCase() ||
+    (q.inline || q.preview ? 'inline' : 'attachment');
+  return disp === 'inline' ? 'inline' : 'attachment';
+}
+
+async function sendFileSmart(req, res, absPath, options = {}) {
+  const filename = path.posix.basename(options.virtualPath || absPath);
+  const stat = await fsp.stat(absPath);
+  if (!stat.isFile()) throw new Error('Not a file');
+
+  const total = stat.size;
+  const range = req.headers.range;
+  const type = options.forceType || guessContentType(filename);
+  const disposition = options.disposition || getDisposition(req);
+
+  // Common headers
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Content-Type', type);
+  res.setHeader(
+    'Content-Disposition',
+    `${disposition}; filename*=UTF-8''${encodeURIComponent(filename)}`
+  );
+  res.setHeader('X-Filename', filename);
+  res.setHeader('Cache-Control', 'no-store');
+
+  if (range) {
+    const m = /^bytes=(\d*)-(\d*)$/.exec(range);
+    if (!m) {
+      res.status(416).end();
+      return;
+    }
+    let start = m[1] ? parseInt(m[1], 10) : 0;
+    let end = m[2] ? parseInt(m[2], 10) : total - 1;
+    if (Number.isNaN(start)) start = 0;
+    if (Number.isNaN(end) || end >= total) end = total - 1;
+    if (start > end || start >= total) {
+      res.status(416).setHeader('Content-Range', `bytes */${total}`).end();
+      return;
+    }
+
+    const chunkSize = end - start + 1;
+    res.status(206);
+    res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+    res.setHeader('Content-Length', chunkSize);
+
+    const stream = fs.createReadStream(absPath, { start, end });
+    stream.on('error', () => {
+      try {
+        res.end();
+      } catch {}
+    });
+    stream.pipe(res);
+  } else {
+    res.setHeader('Content-Length', total);
+    const stream = fs.createReadStream(absPath);
+    stream.on('error', () => {
+      try {
+        res.end();
+      } catch {}
+    });
+    stream.pipe(res);
+  }
+}
+
 /* -------------------- MIDDLEWARE -------------------- */
 app.set('trust proxy', 1);
 
-app.use(
-  helmet({
-    crossOriginResourcePolicy: false,
-  })
-);
-
+app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(cookieParser(COOKIE_SECRET || undefined));
 
-// Allow very long uploads to run to completion
+// keep very long uploads alive end-to-end
 app.use((req, res, next) => {
   req.setTimeout(0);
   res.setTimeout(0);
+  res.setHeader('Connection', 'keep-alive');
   next();
 });
 
-// CORS allowlist (strings and /regex/)
-const defaultOrigins = [/^http:\/\/localhost:\d+$/];
+// CORS allowlist
+const defaultOrigins = [
+  /^http:\/\/localhost:\d+$/,
+  /^https?:\/\/localhost(:\d+)?$/,
+];
 const parsedOrigins = (
   CORS_ORIGINS
     ? CORS_ORIGINS.split(',')
@@ -153,20 +303,41 @@ app.use(
       return cb(err);
     },
     credentials: true,
-    exposedHeaders: ['Content-Disposition', 'Content-Length', 'X-Filename'],
+    exposedHeaders: [
+      'Content-Disposition',
+      'Content-Length',
+      'X-Filename',
+      'Accept-Ranges',
+      'Content-Range',
+      'Content-Type',
+    ],
   })
 );
 
 app.use(express.json({ limit: BODY_LIMIT }));
 app.use(express.urlencoded({ limit: BODY_LIMIT, extended: true }));
-
 app.use(morgan('dev'));
 
-/* -------------------- MULTER (disk-backed + high limits) -------------------- */
-const TMP_DIR =
-  process.env.UPLOAD_TMP_DIR || path.join(os.tmpdir(), 'tcsdatabank-upload');
+/* -------------------- BASIC HEALTH -------------------- */
+app.get('/', (_req, res) =>
+  res.type('text/html; charset=UTF-8').status(200).send('OK')
+);
+app.get('/health', (_req, res) => res.status(200).json({ ok: true }));
+app.get('/api/health', (_req, res) => res.json({ ok: true }));
+
+/* -------------------- STORAGE SETUP -------------------- */
+const STORAGE_ROOT = path.resolve(
+  STORAGE_BASE || path.join(os.homedir(), 'tcsdatabank')
+);
+fs.mkdirSync(STORAGE_ROOT, { recursive: true });
+
+// Put temp inside STORAGE_ROOT by default to avoid cross-device renames
+const TMP_DIR = UPLOAD_TMP_DIR
+  ? path.resolve(UPLOAD_TMP_DIR)
+  : path.join(STORAGE_ROOT, '.tmp-upload');
 fs.mkdirSync(TMP_DIR, { recursive: true });
 
+/* -------------------- MULTER -------------------- */
 const diskStorage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, TMP_DIR),
   filename: (_req, file, cb) =>
@@ -194,20 +365,15 @@ const uploadMulti = multer({
   limits: COMMON_LIMITS,
 }).array('files', COMMON_LIMITS.files);
 
-/* -------------------- STORAGE (LOCAL DISK) HELPERS -------------------- */
-const STORAGE_ROOT = path.resolve(STORAGE_BASE);
-fs.mkdirSync(STORAGE_ROOT, { recursive: true });
-
+/* -------------------- PATH HELPERS -------------------- */
 function toVirtual(absPath) {
   const abs = path.resolve(absPath);
-  if (!abs.startsWith(STORAGE_ROOT)) {
+  if (!abs.startsWith(STORAGE_ROOT))
     throw new Error('Path not under STORAGE_BASE');
-  }
   let rel = path.relative(STORAGE_ROOT, abs);
-  rel = rel.split(path.sep).join('/'); // normalize
+  rel = rel.split(path.sep).join('/');
   return '/' + rel.replace(/^\/+/, '');
 }
-
 function safeJoinBase(virtualPath) {
   const v = String(virtualPath || '/').replace(/\\/g, '/');
   const clean = v.startsWith('/') ? v.slice(1) : v;
@@ -215,7 +381,6 @@ function safeJoinBase(virtualPath) {
   if (!abs.startsWith(STORAGE_ROOT)) throw new Error('Invalid path');
   return abs;
 }
-
 function safeFileOrFolderName(raw) {
   const name = String(raw || '')
     .trim()
@@ -225,6 +390,7 @@ function safeFileOrFolderName(raw) {
   return name || '';
 }
 
+/* -------------------- FS OPS -------------------- */
 async function listDir(virtualPath) {
   const abs = safeJoinBase(virtualPath);
   const st = await fsp.stat(abs);
@@ -244,13 +410,11 @@ async function listDir(virtualPath) {
   }
   return { path: toVirtual(abs), items };
 }
-
 async function ensureDir(virtualPath) {
   const abs = safeJoinBase(virtualPath);
   await fsp.mkdir(abs, { recursive: true });
   return abs;
 }
-
 async function statPathLocal(virtualPath) {
   const abs = safeJoinBase(virtualPath);
   try {
@@ -265,59 +429,63 @@ async function statPathLocal(virtualPath) {
     return { exists: false, isDir: false, size: 0, abs };
   }
 }
-
 async function removeRecursive(virtualPath) {
   const info = await statPathLocal(virtualPath);
   if (!info.exists) return { removedFiles: 0, removedDirs: 0, skipped: true };
-  let files = 0,
-    dirs = 0;
 
-  async function walk(p) {
-    const ents = await fsp.readdir(p, { withFileTypes: true }).catch(() => []);
-    for (const ent of ents) {
-      const child = path.join(p, ent.name);
-      if (ent.isDirectory()) {
-        await walk(child);
-        await fsp.rmdir(child).catch(() => {});
-        dirs++;
-      } else {
-        await fsp.unlink(child).catch(() => {});
-        files++;
+  // Prefer modern rm (Node 16+), fallback if needed
+  try {
+    await fsp.rm(info.abs, { recursive: true, force: true });
+  } catch {
+    // fallback walk
+    let files = 0,
+      dirs = 0;
+    async function walk(p) {
+      const ents = await fsp
+        .readdir(p, { withFileTypes: true })
+        .catch(() => []);
+      for (const ent of ents) {
+        const child = path.join(p, ent.name);
+        if (ent.isDirectory()) {
+          await walk(child);
+          await fsp.rmdir(child).catch(() => {});
+          dirs++;
+        } else {
+          await fsp.unlink(child).catch(() => {});
+          files++;
+        }
       }
     }
+    if (info.isDir) {
+      await walk(info.abs);
+      await fsp.rmdir(info.abs).catch(() => {});
+    } else {
+      await fsp.unlink(info.abs).catch(() => {});
+    }
+    return { removedFiles: files, removedDirs: dirs, skipped: false };
   }
 
-  if (info.isDir) {
-    await walk(info.abs);
-    await fsp.rmdir(info.abs).catch(() => {});
-    dirs++;
-  } else {
-    await fsp.unlink(info.abs);
-    files++;
-  }
-
-  return { removedFiles: files, removedDirs: dirs, skipped: false };
+  // If rm succeeded, we can’t easily count; return generic success
+  return { removedFiles: 0, removedDirs: 0, skipped: false };
 }
-
 async function renamePathLocal(
   fromVirtual,
-  toVirtual,
+  toVirtualPath,
   { overwrite = false } = {}
 ) {
   const fromAbs = safeJoinBase(fromVirtual);
-  const toAbs = safeJoinBase(toVirtual);
+  const toAbs = safeJoinBase(toVirtualPath);
   await fsp.mkdir(path.dirname(toAbs), { recursive: true });
   try {
     await fsp.access(toAbs);
     if (!overwrite) throw new Error('Target already exists');
-    await removeRecursive(toVirtual);
+    await removeRecursive(toVirtualPath);
   } catch {
     /* target missing ok */
   }
-  await fsp.rename(fromAbs, toAbs);
+  await safeMove(fromAbs, toAbs);
   return { fromAbs, toAbs };
 }
-
 async function collectFilesRecursiveVirtual(virtualDir) {
   const rootAbs = safeJoinBase(virtualDir);
   const out = [];
@@ -334,7 +502,6 @@ async function collectFilesRecursiveVirtual(virtualDir) {
   await walk(rootAbs);
   return out;
 }
-
 async function fileSizeOrFolderTotal(virtualPath) {
   const info = await statPathLocal(virtualPath);
   if (!info.exists) throw new Error('Not found');
@@ -357,13 +524,12 @@ async function fileSizeOrFolderTotal(virtualPath) {
   return { isDir: true, size: total };
 }
 
-/* -------------------- DB HELPERS (audit + file index) -------------------- */
+/* -------------------- DB HELPERS -------------------- */
 function pathHash(p) {
   return createHash('sha256')
     .update(String(p || '/'))
     .digest('hex');
 }
-
 async function audit({
   userId = null,
   ip,
@@ -375,32 +541,16 @@ async function audit({
   errorMsg = null,
   meta = null,
 }) {
-  const pool = getPool();
-  await pool
-    .execute(
-      `INSERT INTO audit_events
-     (user_id, ip, action, target_path, target_is_dir, bytes, status, error_msg, meta_json)
-     VALUES (:user_id, INET6_ATON(:ip), :action, :target_path, :target_is_dir, :bytes, :status, :error_msg, :meta_json)`,
-      {
-        user_id: userId,
-        ip: ip || null,
-        action,
-        target_path: targetPath,
-        target_is_dir: targetIsDir ? 1 : 0,
-        bytes: bytes == null ? null : Number(bytes),
-        status,
-        error_msg: errorMsg,
-        meta_json: meta ? JSON.stringify(meta) : null,
-      }
-    )
-    .catch(() => {
-      // Fallback if INET6_ATON is unavailable
-      return pool.execute(
+  try {
+    const pool = getPool();
+    await pool
+      .execute(
         `INSERT INTO audit_events
-       (user_id, ip, action, target_path, target_is_dir, bytes, status, error_msg, meta_json)
-       VALUES (:user_id, NULL, :action, :target_path, :target_is_dir, :bytes, :status, :error_msg, :meta_json)`,
+         (user_id, ip, action, target_path, target_is_dir, bytes, status, error_msg, meta_json)
+         VALUES (:user_id, INET6_ATON(:ip), :action, :target_path, :target_is_dir, :bytes, :status, :error_msg, :meta_json)`,
         {
           user_id: userId,
+          ip: ip || null,
           action,
           target_path: targetPath,
           target_is_dir: targetIsDir ? 1 : 0,
@@ -409,73 +559,86 @@ async function audit({
           error_msg: errorMsg,
           meta_json: meta ? JSON.stringify(meta) : null,
         }
+      )
+      .catch(() =>
+        pool.execute(
+          `INSERT INTO audit_events
+           (user_id, ip, action, target_path, target_is_dir, bytes, status, error_msg, meta_json)
+           VALUES (:user_id, NULL, :action, :target_path, :target_is_dir, :bytes, :status, :error_msg, :meta_json)`,
+          {
+            user_id: userId,
+            action,
+            target_path: targetPath,
+            target_is_dir: targetIsDir ? 1 : 0,
+            bytes: bytes == null ? null : Number(bytes),
+            status,
+            error_msg: errorMsg,
+            meta_json: meta ? JSON.stringify(meta) : null,
+          }
+        )
       );
-    });
+  } catch (e) {
+    console.warn('audit skipped:', e.message);
+  }
 }
-
 async function upsertFileEntry({
   path: vpath,
   isDir,
   sizeBytes = null,
   modifiedAt = null,
 }) {
-  const pool = getPool();
-  await pool.execute(
-    `INSERT INTO file_entries (path, path_hash, is_dir, size_bytes, modified_at)
-     VALUES (:p, :h, :d, :s, :m)
-     ON DUPLICATE KEY UPDATE
-       is_dir=VALUES(is_dir),
-       size_bytes=VALUES(size_bytes),
-       modified_at=VALUES(modified_at),
-       updated_at=CURRENT_TIMESTAMP`,
-    {
-      p: vpath,
-      h: pathHash(vpath),
-      d: isDir ? 1 : 0,
-      s: sizeBytes,
-      m: modifiedAt,
-    }
-  );
+  try {
+    const pool = getPool();
+    await pool.execute(
+      `INSERT INTO file_entries (path, path_hash, is_dir, size_bytes, modified_at)
+       VALUES (:p, :h, :d, :s, :m)
+       ON DUPLICATE KEY UPDATE
+         is_dir=VALUES(is_dir),
+         size_bytes=VALUES(size_bytes),
+         modified_at=VALUES(modified_at),
+         updated_at=CURRENT_TIMESTAMP`,
+      {
+        p: vpath,
+        h: pathHash(vpath),
+        d: isDir ? 1 : 0,
+        s: sizeBytes,
+        m: modifiedAt,
+      }
+    );
+  } catch (e) {
+    console.warn('upsertFileEntry skipped:', e.message);
+  }
 }
-
 async function deleteFileEntryByPathPrefix(prefix) {
-  const pool = getPool();
-  await pool.execute(
-    `DELETE FROM file_entries WHERE path_hash = :h OR path = :p`,
-    { h: pathHash(prefix), p: prefix }
-  );
-  await pool.execute(`DELETE FROM file_entries WHERE path LIKE :pref`, {
-    pref: prefix.endsWith('/') ? `${prefix}%` : `${prefix}/%`,
-  });
+  try {
+    const pool = getPool();
+    await pool.execute(
+      `DELETE FROM file_entries WHERE path_hash = :h OR path = :p`,
+      { h: pathHash(prefix), p: prefix }
+    );
+  } catch {}
+  try {
+    const pool = getPool();
+    await pool.execute(`DELETE FROM file_entries WHERE path LIKE :pref`, {
+      pref: prefix.endsWith('/') ? `${prefix}%` : `${prefix}/%`,
+    });
+  } catch (e) {
+    console.warn('deleteFileEntry skipped:', e.message);
+  }
 }
-
 async function renamePathPrefix(oldPrefix, newPrefix) {
-  const pool = getPool();
-  await pool.execute(
-    `UPDATE file_entries SET path=:np, path_hash=:nh
-     WHERE path_hash=:oh`,
-    { np: newPrefix, nh: pathHash(newPrefix), oh: pathHash(oldPrefix) }
-  );
-  const oldLenPlus1 = oldPrefix.length + 1;
-  await pool.execute(
-    `UPDATE file_entries
-       SET path = CONCAT(:np, SUBSTRING(path, :cut)),
-           path_hash = SHA2(CONCAT(:np, SUBSTRING(path, :cut)), 256)
-     WHERE path LIKE :oldChildren`,
-    {
-      np: newPrefix,
-      cut: oldLenPlus1,
-      oldChildren: oldPrefix.endsWith('/') ? `${oldPrefix}%` : `${oldPrefix}/%`,
-    }
-  );
+  try {
+    const pool = getPool();
+    await pool.execute(
+      `UPDATE file_entries SET path=:np, path_hash=:nh WHERE path_hash=:oh`,
+      { np: newPrefix, nh: pathHash(newPrefix), oh: pathHash(oldPrefix) }
+    );
+  } catch (e) {
+    console.warn('renamePathPrefix skipped:', e.message);
+  }
 }
 
 /* -------------------- ROUTES -------------------- */
-
-// Public health
-app.get('/api/health', (_req, res) => res.json({ ok: true }));
-
-/* ----- PUBLIC (no auth) ----- */
 
 // List folder
 app.get('/api/list', async (req, res) => {
@@ -665,7 +828,7 @@ app.get('/api/file/content', async (req, res) => {
 
 /* -------------------- UPLOADS -------------------- */
 
-// Single file (path in body.path)
+// Single file (path in body.path) — fixed for traversal + overwrite
 app.post('/api/upload', (req, res) => {
   uploadSingle(req, res, async (err) => {
     if (err) return res.status(400).json({ ok: false, error: err.message });
@@ -674,6 +837,7 @@ app.post('/api/upload', (req, res) => {
       if (!req.file)
         throw new Error('No file uploaded. Field name must be "file".');
       tmpPath = req.file.path;
+
       const targetBase =
         req.body &&
         typeof req.body.path === 'string' &&
@@ -682,14 +846,48 @@ app.post('/api/upload', (req, res) => {
           : '/';
 
       await ensureDir(targetBase);
-      const destAbsDir = safeJoinBase(targetBase);
-      const targetAbs = path.join(destAbsDir, req.file.originalname);
 
-      await fsp.rename(tmpPath, targetAbs);
-      const st = await fsp.stat(targetAbs);
+      // sanitize filename to basename + safe characters
+      const baseName = path.posix.basename(req.file.originalname || 'file');
+      const safeName = safeFileOrFolderName(baseName) || 'file';
+
+      // build the virtual path first, then resolve safely
+      let destVPath = path.posix.join(targetBase, safeName);
+      const targetAbs = safeJoinBase(destVPath);
+
+      // overwrite policy (optional flag)
+      const overwrite = String(req.body?.overwrite).toLowerCase() === 'true';
+      try {
+        await fsp.access(targetAbs);
+        if (!overwrite) {
+          // auto-unique to avoid clobbering
+          const dir = path.posix.dirname(destVPath);
+          const ext = path.posix.extname(safeName);
+          const stem = ext ? safeName.slice(0, -ext.length) : safeName;
+          let i = 1;
+          while (true) {
+            const candidate = path.posix.join(dir, `${stem} (${i})${ext}`);
+            try {
+              await fsp.access(safeJoinBase(candidate));
+              i++;
+            } catch {
+              destVPath = candidate;
+              break;
+            }
+          }
+        } else {
+          await fsp.unlink(targetAbs).catch(() => {});
+        }
+      } catch {
+        /* target missing ok */
+      }
+
+      const finalAbs = safeJoinBase(destVPath);
+      await safeMove(tmpPath, finalAbs);
+      const st = await fsp.stat(finalAbs);
 
       await upsertFileEntry({
-        path: toVirtual(targetAbs),
+        path: destVPath,
         isDir: false,
         sizeBytes: st.size,
         modifiedAt: st.mtime,
@@ -698,8 +896,8 @@ app.post('/api/upload', (req, res) => {
       res.json({
         ok: true,
         uploaded: {
-          to: toVirtual(targetAbs),
-          filename: req.file.originalname,
+          to: destVPath,
+          filename: path.posix.basename(destVPath),
           bytes: st.size,
         },
       });
@@ -707,10 +905,10 @@ app.post('/api/upload', (req, res) => {
       audit({
         ip: req.ip,
         action: 'upload_file',
-        targetPath: toVirtual(targetAbs),
+        targetPath: destVPath,
         targetIsDir: false,
         bytes: st.size,
-        meta: { filename: req.file.originalname },
+        meta: { filename: path.posix.basename(destVPath), overwrite },
       });
     } catch (e) {
       res.status(400).json({ ok: false, error: e.message });
@@ -722,6 +920,7 @@ app.post('/api/upload', (req, res) => {
 
 /**
  * Upload an entire folder preserving EVERY subfolder and file.
+ * Expects fields: files[] + paths[] (parallel), optional dirs[] for empty dirs, and dest.
  */
 app.post('/api/upload-folder', (req, res) => {
   uploadMulti(req, res, async (err) => {
@@ -738,9 +937,8 @@ app.post('/api/upload-folder', (req, res) => {
       const files = Array.isArray(req.files) ? req.files : [];
       const hasAnyFiles = files.length > 0;
 
-      // Normalize paths (string | array | missing)
+      // Normalize client-sent relative paths
       let relPaths = req.body?.paths ?? req.body?.relativePaths ?? null;
-
       if (relPaths == null) {
         relPaths = files.map((f) =>
           f.originalname && f.originalname.includes('/')
@@ -753,7 +951,6 @@ app.post('/api/upload-folder', (req, res) => {
         relPaths = files.map((f) => f.webkitRelativePath || f.originalname);
       }
 
-      // Align counts (prevents mismatch)
       if (hasAnyFiles && relPaths.length !== files.length) {
         const aligned = new Array(files.length);
         for (let i = 0; i < files.length; i++) {
@@ -766,7 +963,6 @@ app.post('/api/upload-folder', (req, res) => {
         relPaths = aligned;
       }
 
-      // Optional empty folders
       let rawDirs = req.body?.dirs ?? req.body?.directories ?? [];
       if (typeof rawDirs === 'string') rawDirs = [rawDirs];
       if (!Array.isArray(rawDirs)) rawDirs = [];
@@ -793,7 +989,9 @@ app.post('/api/upload-folder', (req, res) => {
           const parts = parent.split('/').filter(Boolean);
           let accum = '';
           for (const part of parts) {
-            accum = accum ? `${accum}/${part}` : part;
+            const safe = safeFileOrFolderName(part);
+            if (!safe) continue;
+            accum = accum ? `${accum}/${safe}` : safe;
             dirSet.add(accum);
           }
         }
@@ -807,7 +1005,9 @@ app.post('/api/upload-folder', (req, res) => {
           const parts = clean.split('/').filter(Boolean);
           let accum = '';
           for (const part of parts) {
-            accum = accum ? `${accum}/${part}` : part;
+            const safe = safeFileOrFolderName(part);
+            if (!safe) continue;
+            accum = accum ? `${accum}/${safe}` : safe;
             dirSet.add(accum);
           }
         }
@@ -829,15 +1029,22 @@ app.post('/api/upload-folder', (req, res) => {
       const uploaded = [];
       for (let i = 0; i < files.length; i++) {
         const f = files[i];
-        const rel = path.posix.normalize(
-          String(relPaths[i] || f.originalname)
-            .replace(/^[\\/]+/, '')
-            .replace(/\\/g, '/')
-        );
+        const rawRel = String(relPaths[i] || f.originalname)
+          .replace(/^[\\/]+/, '')
+          .replace(/\\/g, '/');
+
+        // sanitize each path segment to prevent traversal & bad chars
+        const segs = rawRel
+          .split('/')
+          .filter(Boolean)
+          .map(safeFileOrFolderName)
+          .filter(Boolean);
+        const rel = segs.join('/');
+
         const destVPath = path.posix.join(destBase, rel);
         const destAbs = safeJoinBase(destVPath);
         await fsp.mkdir(path.dirname(destAbs), { recursive: true });
-        await fsp.rename(f.path, destAbs);
+        await safeMove(f.path, destAbs);
         const st = await fsp.stat(destAbs);
         uploaded.push({
           to: destVPath,
@@ -851,12 +1058,6 @@ app.post('/api/upload-folder', (req, res) => {
           modifiedAt: st.mtime,
         });
       }
-
-      console.log('[UPLOAD-FOLDER OK]', {
-        base: destBase,
-        files: files.length,
-        createdDirs: dirSet.size,
-      });
 
       audit({
         ip: req.ip,
@@ -879,7 +1080,6 @@ app.post('/api/upload-folder', (req, res) => {
         .status(400)
         .json({ ok: false, error: e?.message || 'Upload failed' });
     } finally {
-      // Cleanup tmp files from disk
       await Promise.allSettled(
         (req.files || [])
           .map((f) => f?.path)
@@ -890,39 +1090,68 @@ app.post('/api/upload-folder', (req, res) => {
   });
 });
 
-/* -------------------- DOWNLOAD -------------------- */
+/* -------------------- DOWNLOAD / PREVIEW / STREAM -------------------- */
 app.get('/api/download', async (req, res) => {
   try {
     const vpath = (req.query && req.query.path) || '/';
     const abs = safeJoinBase(vpath);
-    const filename = path.posix.basename(vpath);
-
-    const st = await fsp.stat(abs);
-    if (!st.isFile()) throw new Error('Not a file');
-
-    res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader(
-      'Content-Disposition',
-      "attachment; filename*=UTF-8''" + encodeURIComponent(filename)
-    );
-    res.setHeader('X-Filename', filename);
-    res.setHeader('Cache-Control', 'no-store');
-
+    await sendFileSmart(req, res, abs, { virtualPath: vpath });
     audit({
       ip: req.ip,
       action: 'download',
       targetPath: vpath,
       targetIsDir: false,
-      bytes: st.size,
     });
+  } catch (e) {
+    if (!res.headersSent) res.status(400).json({ ok: false, error: e.message });
+    else {
+      try {
+        res.end();
+      } catch {}
+    }
+  }
+});
 
-    fs.createReadStream(abs)
-      .on('error', () => {
-        try {
-          res.end();
-        } catch {}
-      })
-      .pipe(res);
+// Always inline (great for <img>, <object>, <iframe>, <video>, <audio>)
+app.get('/api/preview', async (req, res) => {
+  try {
+    const vpath = (req.query && req.query.path) || '/';
+    const abs = safeJoinBase(vpath);
+    await sendFileSmart(req, res, abs, {
+      virtualPath: vpath,
+      disposition: 'inline',
+    });
+    audit({
+      ip: req.ip,
+      action: 'preview',
+      targetPath: vpath,
+      targetIsDir: false,
+    });
+  } catch (e) {
+    if (!res.headersSent) res.status(400).json({ ok: false, error: e.message });
+    else {
+      try {
+        res.end();
+      } catch {}
+    }
+  }
+});
+
+// Alias for media players (inline + range)
+app.get('/api/stream', async (req, res) => {
+  try {
+    const vpath = (req.query && req.query.path) || '/';
+    const abs = safeJoinBase(vpath);
+    await sendFileSmart(req, res, abs, {
+      virtualPath: vpath,
+      disposition: 'inline',
+    });
+    audit({
+      ip: req.ip,
+      action: 'stream',
+      targetPath: vpath,
+      targetIsDir: false,
+    });
   } catch (e) {
     if (!res.headersSent) res.status(400).json({ ok: false, error: e.message });
     else {
@@ -945,17 +1174,15 @@ app.post('/api/zip', async (req, res) => {
 
     const info = await statPathLocal(folderVPath);
     if (!info.exists || !info.isDir) {
-      return res.status(400).json({
-        ok: false,
-        error: 'Folder not found or is not a directory',
-      });
+      return res
+        .status(400)
+        .json({ ok: false, error: 'Folder not found or is not a directory' });
     }
 
-    if (pendingZips.size > 500) {
+    if (pendingZips.size > 500)
       return res
         .status(429)
         .json({ ok: false, error: 'Too many pending ZIP jobs' });
-    }
 
     const folderName =
       safeFileOrFolderName(path.posix.basename(folderVPath)) || 'folder';
@@ -1086,11 +1313,10 @@ app.post('/api/zip-multi', async (req, res) => {
     }
     if (!zipName.toLowerCase().endsWith('.zip')) zipName += '.zip';
 
-    if (pendingMultiZips.size > 500) {
+    if (pendingMultiZips.size > 500)
       return res
         .status(429)
         .json({ ok: false, error: 'Too many pending ZIP jobs' });
-    }
 
     const id = randomUUID();
     pendingMultiZips.set(id, {
@@ -1188,7 +1414,6 @@ app.put('/api/folder', async (req, res) => {
     await renamePathLocal(rawFrom, rawTo, {
       overwrite: String(req.body?.overwrite).toLowerCase() === 'true',
     });
-
     await renamePathPrefix(rawFrom, rawTo);
 
     res.json({ ok: true, from: rawFrom, to: rawTo });
@@ -1234,7 +1459,6 @@ app.post('/api/file/rename', async (req, res) => {
     await renamePathLocal(from, to, {
       overwrite: String(req.body?.overwrite).toLowerCase() === 'true',
     });
-
     await renamePathPrefix(from, to);
 
     res.json({ ok: true, from, to });
@@ -1279,7 +1503,7 @@ app.post('/api/delete', deleteHandler);
 app.delete('/api/file', deleteHandler);
 app.delete('/api/folder', deleteHandler);
 
-/* -------------------- ADMIN (kept behind your router) -------------------- */
+/* -------------------- ADMIN (optional) -------------------- */
 app.use('/api/admin', adminRouter);
 
 /* -------------------- HOUSEKEEPING -------------------- */
@@ -1315,6 +1539,7 @@ process.on('unhandledRejection', (r) =>
 process.on('uncaughtException', (e) => console.error('UncaughtException:', e));
 
 /* -------------------- START -------------------- */
-app.listen(Number(PORT), () => {
-  console.log(`tcsdatabank-server running on http://localhost:${PORT}`);
+const port = Number(PORT) || 3000; // Passenger provides PORT env
+app.listen(port, () => {
+  console.log(`tcsdatabank-server running on port ${port}`);
 });

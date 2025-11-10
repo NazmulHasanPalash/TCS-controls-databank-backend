@@ -1,0 +1,22 @@
+# Use Passenger (Node app)
+
+PassengerAppType node
+PassengerStartupFile server.js
+PassengerNodejs /opt/cpanel/ea-nodejs20/bin/node
+PassengerAppEnv production
+PassengerResolveSymlinksInDocumentRoot on
+
+# Let Apache accept large bodies; 0 means “no limit” (host policy may cap)
+
+LimitRequestBody 0
+
+# Keep long uploads alive (host policy may override)
+
+RequestReadTimeout header=0 body=0
+
+# Optional: increase Passenger concurrency headroom
+
+PassengerMaxPoolSize 6
+PassengerMaxInstancesPerApp 6
+PassengerPoolIdleTime 600
+PassengerMinInstances 1

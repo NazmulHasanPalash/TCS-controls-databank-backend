@@ -2,7 +2,7 @@
 // Admin endpoints to manage user roles in Firestore BY EMAIL (writes to users/<uid>).
 // Requires:
 //   - ./firebase-admin  -> exports { admin } (initialized Admin SDK instance)
-//   - ./auth-rbac       -> exports { requireAuth, requireRole } OR { requireAuth, minRole }
+//   - ./auth-rbac       -> exports { requireAuth, requireRole, minRole?, setUserRole }
 
 'use strict';
 
@@ -16,7 +16,7 @@ const rbac = require('./auth-rbac');
 // Ensure requireAuth exists (your server uses it)
 const requireAuth = rbac.requireAuth;
 
-// Compatibility shim — if requireRole is not exported, map to minRole('admin')
+// Prefer requireRole; if missing, fallback to minRole('admin')
 const requireRole =
   rbac.requireRole ||
   function fallbackRequireRole(roles) {
@@ -31,13 +31,16 @@ const requireRole =
     };
   };
 
+// Pull helper for role persistence (validates + busts cache)
+const { setUserRole } = rbac;
+
 /* ===================== Firebase Admin ==================== */
 const { admin } = require('./firebase-admin'); // initialized Admin SDK
 
 const db = admin.firestore();
 const FieldValue = admin.firestore.FieldValue;
 
-// Allow "user" as the baseline role (alongside legacy "operator")
+// Allowed roles (server truth)
 const ALLOWED_ROLES = ['admin', 'moderator', 'operator', 'user'];
 
 /* -------------------- helpers -------------------- */
@@ -45,14 +48,12 @@ function normalizeRole(value) {
   const r = String(value || '')
     .trim()
     .toLowerCase();
-  // Treat legacy "operator" as "user" if you wish to consolidate
-  const mapped = r === 'operator' ? 'user' : r;
-  if (!ALLOWED_ROLES.includes(mapped)) {
+  if (!ALLOWED_ROLES.includes(r)) {
     throw new Error(
       'Invalid "role". Expected one of: admin, moderator, operator, user'
     );
   }
-  return mapped;
+  return r;
 }
 
 function toEmailLower(email) {
@@ -83,11 +84,11 @@ function shapeUserDoc(snap) {
     name: data.name || '',
     // Default to "user" as the baseline role
     role: String(data.role || 'user').toLowerCase(),
-    updatedAt: data.updatedAt || null,
+    updatedAt: data.updatedAt || null, // Firestore Timestamp or ms (frontend handles both)
   };
 }
 
-/* ================= Additional helpers (NEW) ================= */
+/* ================= Additional helpers ================= */
 // Resolve uid by email (Auth); returns null if not found
 async function resolveUidByEmail(emailLower) {
   try {
@@ -112,7 +113,7 @@ async function deleteUserByUid(uid) {
     await admin.auth().deleteUser(uid);
     result.deletedAuth = true;
   } catch (err) {
-    if (err && err.code !== 'auth/user-not-found') {
+    if (!(err && err.code === 'auth/user-not-found')) {
       throw err;
     }
   }
@@ -131,18 +132,14 @@ async function deleteUserByUid(uid) {
 
 /**
  * GET /api/admin/users
- * Signed-in users can list users OR look up by exact email.
+ * Admins can list users OR look up by exact email.
  *
  * - If query `?email=user@example.com` provided:
  *    returns { ok: true, user: { ... } } with `user` null if not found
  * - Otherwise:
  *    returns { ok: true, items: [ { ... }, ... ] } (limited set)
- *
- * NOTE:
- * - Your original allowed any signed-in user; kept the same.
- * - If you want ONLY admins to use this route, switch middleware to requireRole(['admin']).
  */
-router.get('/users', requireAuth, async (req, res) => {
+router.get('/users', requireAuth, requireRole(['admin']), async (req, res) => {
   try {
     const raw = (req.query && req.query.email) || '';
     const emailFilter = String(raw).trim();
@@ -202,25 +199,41 @@ async function upsertRoleHandler(req, res) {
       uid = rec.uid;
     } catch (err) {
       if (err && err.code === 'auth/user-not-found') {
-        const created = await admin.auth().createUser({ email: emailLower });
+        const created = await admin.auth().createUser({
+          email: emailLower,
+          displayName: name || undefined,
+        });
         uid = created.uid;
       } else {
         throw err;
       }
     }
 
-    const payload = {
-      email,
-      emailLower,
-      role,
-      updatedAt: FieldValue.serverTimestamp(),
-      ...(name ? { name } : {}),
-    };
+    // 1) Persist role via RBAC helper (validates + busts cache)
+    await setUserRole(uid, role);
 
+    // 2) Mirror role to custom claims (optional but recommended)
+    try {
+      await admin.auth().setCustomUserClaims(uid, { role });
+    } catch (e) {
+      // Non-fatal; proceed even if custom claims fails
+      console.warn('[RBAC] setCustomUserClaims failed:', e?.message || e);
+    }
+
+    // 3) Merge other fields into Firestore user doc
     const ref = db.collection('users').doc(uid);
-    await ref.set(payload, { merge: true });
+    await ref.set(
+      {
+        email,
+        emailLower,
+        role, // keep role in document for listing UI
+        updatedAt: FieldValue.serverTimestamp(),
+        ...(name ? { name } : {}),
+      },
+      { merge: true }
+    );
 
-    // Re-read to return shaped data
+    // 4) Re-read to return shaped data (ensures we return what was saved)
     const docSnap = await ref.get();
     const user = shapeUserDoc(docSnap);
 
@@ -241,7 +254,7 @@ router.post(
   upsertRoleHandler
 );
 
-/* ========================= DELETE user (NEW) ========================= */
+/* ========================= DELETE user ========================= */
 /**
  * DELETE /api/admin/users/by-email
  * Body: { email: "user@example.com" }
