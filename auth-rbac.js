@@ -4,7 +4,7 @@
 // Exports:
 //   - requireAuth(req,res,next)
 //   - requireRole(allowedRoles)(req,res,next)
-//   - minRole(minRoleName)(req,res,next)   // e.g. minRole('user') / 'operator' / 'moderator' / 'admin'
+//   - minRole(minRoleName)(req,res,next)   // e.g. minRole('new_register') / 'user' / 'associate' / 'operator' / 'moderator' / 'admin'
 //   - setUserRole(uid, role)
 //   - getUserRole(uid)
 //   - ROLE_ORDER
@@ -13,11 +13,11 @@
 //   Collection: users
 //   Doc ID: <uid>
 //   Fields:
-//     role: "admin" | "moderator" | "operator" | "user"
+//     role: "new_register" | "user" | "associate" | "operator" | "moderator" | "admin"
 //     updatedAt: <number ms since epoch or Firestore Timestamp>
 //
 // Notes:
-//   * If a user doc or role is missing, default to "user" (lowest).
+//   * If a user doc or role is missing, default to "new_register" (lowest).
 //   * Requires firebase-admin to be initialized in ./firebase-admin.
 //   * If you want to read a token from a cookie, make sure your app uses cookie-parser:
 //       const cookieParser = require('cookie-parser');
@@ -28,15 +28,24 @@
 const { admin } = require('./firebase-admin'); // Initialized Admin SDK
 const db = admin.firestore();
 
-/** Display order (for reference/UI only). */
-const ROLE_ORDER = ['user', 'operator', 'moderator', 'admin'];
+/** Display order (for reference/UI only). Lowest → Highest. */
+const ROLE_ORDER = [
+  'new_register',
+  'user',
+  'associate',
+  'operator',
+  'moderator',
+  'admin',
+];
 
 /** Comparable levels (higher number = higher privilege). */
 const ROLE_LEVEL = {
-  user: 0,
-  operator: 1,
-  moderator: 2,
-  admin: 3,
+  new_register: 0,
+  user: 1,
+  associate: 2,
+  operator: 3,
+  moderator: 4,
+  admin: 5,
 };
 
 // Small in-memory cache to reduce Firestore reads
@@ -59,7 +68,7 @@ function isAllowedRole(role) {
 
 function getRoleLevel(role) {
   const r = normalizeRole(role);
-  return isAllowedRole(r) ? ROLE_LEVEL[r] : ROLE_LEVEL.user;
+  return isAllowedRole(r) ? ROLE_LEVEL[r] : ROLE_LEVEL['new_register'];
 }
 
 function fromCache(uid) {
@@ -115,9 +124,9 @@ async function requireAuth(req, res, next) {
   }
 }
 
-/** getUserRole — reads role from Firestore (cached). Defaults to "user". */
+/** getUserRole — reads role from Firestore (cached). Defaults to "new_register". */
 async function getUserRole(uid) {
-  if (!uid || typeof uid !== 'string') return 'user';
+  if (!uid || typeof uid !== 'string') return 'new_register';
 
   const cached = fromCache(uid);
   if (cached) return cached;
@@ -125,8 +134,8 @@ async function getUserRole(uid) {
   const snap = await db.collection('users').doc(uid).get();
   const roleRaw = snap.exists ? snap.data().role : null;
 
-  let role = normalizeRole(roleRaw || 'user');
-  if (!isAllowedRole(role)) role = 'user';
+  let role = normalizeRole(roleRaw || 'new_register');
+  if (!isAllowedRole(role)) role = 'new_register';
 
   setCache(uid, role);
   return role;
@@ -162,7 +171,9 @@ function requireRole(allowedRoles = []) {
 }
 
 /**
- * minRole('user') → allows user, operator, moderator, admin (>=).
+ * minRole('new_register') → allows everyone (>= new_register).
+ * minRole('user') → allows user, associate, operator, moderator, admin.
+ * minRole('associate') → allows associate, operator, moderator, admin.
  * minRole('operator') → allows operator, moderator, admin.
  * minRole('moderator') → allows moderator, admin.
  * minRole('admin') → allows admin only.
@@ -200,7 +211,7 @@ async function setUserRole(uid, role) {
   const normalized = normalizeRole(role);
   if (!isAllowedRole(normalized)) {
     throw new Error(
-      'Invalid role ("admin", "moderator", "operator", or "user")'
+      'Invalid role (expected one of: ' + ROLE_ORDER.join(', ') + ')'
     );
   }
   if (!uid || typeof uid !== 'string') {
@@ -220,7 +231,7 @@ async function setUserRole(uid, role) {
 module.exports = {
   requireAuth,
   requireRole,
-  minRole, // use as minRole('operator') / 'moderator' / 'admin' where needed
+  minRole,
   setUserRole,
   getUserRole,
   ROLE_ORDER,

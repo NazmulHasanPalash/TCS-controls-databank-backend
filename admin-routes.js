@@ -7,10 +7,10 @@
 'use strict';
 
 const express = require('express');
+const crypto = require('crypto');
 const router = express.Router();
 
 /* ========================= RBAC ========================= */
-// Import the whole RBAC module to support both requireRole and minRole.
 const rbac = require('./auth-rbac');
 
 // Ensure requireAuth exists (your server uses it)
@@ -40,8 +40,16 @@ const { admin } = require('./firebase-admin'); // initialized Admin SDK
 const db = admin.firestore();
 const FieldValue = admin.firestore.FieldValue;
 
-// Allowed roles (server truth)
-const ALLOWED_ROLES = ['admin', 'moderator', 'operator', 'user'];
+/* ===================== Roles ===================== */
+// Server truth — includes new roles.
+const ALLOWED_ROLES = [
+  'new_register',
+  'user',
+  'associate',
+  'operator',
+  'moderator',
+  'admin',
+];
 
 /* -------------------- helpers -------------------- */
 function normalizeRole(value) {
@@ -50,7 +58,7 @@ function normalizeRole(value) {
     .toLowerCase();
   if (!ALLOWED_ROLES.includes(r)) {
     throw new Error(
-      'Invalid "role". Expected one of: admin, moderator, operator, user'
+      'Invalid "role". Expected one of: ' + ALLOWED_ROLES.join(', ')
     );
   }
   return r;
@@ -82,9 +90,9 @@ function shapeUserDoc(snap) {
     email: data.email || '',
     emailLower: data.emailLower || '',
     name: data.name || '',
-    // Default to "user" as the baseline role
-    role: String(data.role || 'user').toLowerCase(),
-    updatedAt: data.updatedAt || null, // Firestore Timestamp or ms (frontend handles both)
+    // Default to "new_register" if role missing (for fresh logins without a role set yet)
+    role: String(data.role || 'new_register').toLowerCase(),
+    updatedAt: data.updatedAt || null, // Firestore Timestamp or ms
   };
 }
 
@@ -102,26 +110,19 @@ async function resolveUidByEmail(emailLower) {
 
 // Delete user in Auth and Firestore (best-effort Firestore)
 async function deleteUserByUid(uid) {
-  const result = {
-    ok: true,
-    uid,
-    deletedAuth: false,
-    deletedUserDoc: false,
-  };
+  const result = { ok: true, uid, deletedAuth: false, deletedUserDoc: false };
 
   try {
     await admin.auth().deleteUser(uid);
     result.deletedAuth = true;
   } catch (err) {
-    if (!(err && err.code === 'auth/user-not-found')) {
-      throw err;
-    }
+    if (!(err && err.code === 'auth/user-not-found')) throw err;
   }
 
   try {
     await db.collection('users').doc(uid).delete();
     result.deletedUserDoc = true;
-  } catch (_) {
+  } catch {
     // ignore Firestore delete errors
   }
 
@@ -152,7 +153,7 @@ router.get('/users', requireAuth, requireRole(['admin']), async (req, res) => {
       try {
         const userRecord = await admin.auth().getUserByEmail(emailLower);
         docSnap = await db.collection('users').doc(userRecord.uid).get();
-      } catch (_err) {
+      } catch {
         // If user is not in Auth, fall back to Firestore query by emailLower
         const q = await db
           .collection('users')
@@ -194,16 +195,29 @@ async function upsertRoleHandler(req, res) {
 
     // Resolve UID from Auth; create user if not found
     let uid;
+    let resetLink = null;
+
     try {
       const rec = await admin.auth().getUserByEmail(emailLower);
       uid = rec.uid;
     } catch (err) {
       if (err && err.code === 'auth/user-not-found') {
+        // Create with a strong temporary password so the account can sign in
+        const tempPassword = crypto.randomUUID() + 'Aa1!';
         const created = await admin.auth().createUser({
           email: emailLower,
           displayName: name || undefined,
+          password: tempPassword,
+          emailVerified: false,
         });
         uid = created.uid;
+
+        // Generate a password reset link so the user sets their own password
+        try {
+          resetLink = await admin.auth().generatePasswordResetLink(emailLower);
+        } catch (e) {
+          console.warn('generatePasswordResetLink failed:', e?.message || e);
+        }
       } else {
         throw err;
       }
@@ -227,8 +241,8 @@ async function upsertRoleHandler(req, res) {
         email,
         emailLower,
         role, // keep role in document for listing UI
+        name: name || FieldValue.delete?.() || undefined,
         updatedAt: FieldValue.serverTimestamp(),
-        ...(name ? { name } : {}),
       },
       { merge: true }
     );
@@ -237,7 +251,9 @@ async function upsertRoleHandler(req, res) {
     const docSnap = await ref.get();
     const user = shapeUserDoc(docSnap);
 
-    return res.json({ ok: true, user });
+    const payload = { ok: true, user };
+    if (resetLink) payload.resetLink = resetLink; // show in response (email it in production)
+    return res.json(payload);
   } catch (e) {
     return res
       .status(400)
