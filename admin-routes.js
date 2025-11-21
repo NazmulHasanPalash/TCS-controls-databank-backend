@@ -1,9 +1,3 @@
-// admin-routes.js
-// Admin endpoints to manage user roles in Firestore BY EMAIL (writes to users/<uid>).
-// Requires:
-//   - ./firebase-admin  -> exports { admin } (initialized Admin SDK instance)
-//   - ./auth-rbac       -> exports { requireAuth, requireRole, minRole?, setUserRole }
-
 'use strict';
 
 const express = require('express');
@@ -41,14 +35,27 @@ const db = admin.firestore();
 const FieldValue = admin.firestore.FieldValue;
 
 /* ===================== Roles ===================== */
-// Server truth — includes new roles.
+// Server truth — includes new roles (associate removed).
 const ALLOWED_ROLES = [
   'new_register',
   'user',
-  'associate',
   'operator',
   'moderator',
   'admin',
+
+  // New “main” roles
+  'sales',
+  'production',
+  'finance',
+  'hr',
+  'administrative',
+
+  // New “onboarding” roles
+  'new_sales',
+  'new_production',
+  'new_finance',
+  'new_hr',
+  'new_administrative',
 ];
 
 /* -------------------- helpers -------------------- */
@@ -70,6 +77,23 @@ function toEmailLower(email) {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v))
     throw new Error('email is invalid');
   return v.toLowerCase();
+}
+
+/**
+ * Try to read the current caller's role from req.
+ * Works with different shapes: req.user.role, customClaims, req.userRole, etc.
+ */
+function getCurrentRole(req) {
+  if (!req) return null;
+  const u = req.user || {};
+  const fromUser =
+    (u.customClaims && u.customClaims.role) ||
+    (u.token && u.token.role) ||
+    u.role;
+  const fromReq = req.userRole || req.role;
+
+  const val = fromUser || fromReq;
+  return val ? String(val).toLowerCase() : null;
 }
 
 /**
@@ -133,50 +157,55 @@ async function deleteUserByUid(uid) {
 
 /**
  * GET /api/admin/users
- * Admins can list users OR look up by exact email.
+ * Admins & moderators can list users OR look up by exact email.
  *
  * - If query `?email=user@example.com` provided:
  *    returns { ok: true, user: { ... } } with `user` null if not found
  * - Otherwise:
  *    returns { ok: true, items: [ { ... }, ... ] } (limited set)
  */
-router.get('/users', requireAuth, requireRole(['admin']), async (req, res) => {
-  try {
-    const raw = (req.query && req.query.email) || '';
-    const emailFilter = String(raw).trim();
+router.get(
+  '/users',
+  requireAuth,
+  requireRole(['admin', 'moderator']),
+  async (req, res) => {
+    try {
+      const raw = (req.query && req.query.email) || '';
+      const emailFilter = String(raw).trim();
 
-    if (emailFilter) {
-      const emailLower = toEmailLower(emailFilter);
+      if (emailFilter) {
+        const emailLower = toEmailLower(emailFilter);
 
-      // Prefer resolving via Auth to get the UID, then read users/<uid>
-      let docSnap = null;
-      try {
-        const userRecord = await admin.auth().getUserByEmail(emailLower);
-        docSnap = await db.collection('users').doc(userRecord.uid).get();
-      } catch {
-        // If user is not in Auth, fall back to Firestore query by emailLower
-        const q = await db
-          .collection('users')
-          .where('emailLower', '==', emailLower)
-          .limit(1)
-          .get();
-        docSnap = q.empty ? null : q.docs[0];
+        // Prefer resolving via Auth to get the UID, then read users/<uid>
+        let docSnap = null;
+        try {
+          const userRecord = await admin.auth().getUserByEmail(emailLower);
+          docSnap = await db.collection('users').doc(userRecord.uid).get();
+        } catch {
+          // If user is not in Auth, fall back to Firestore query by emailLower
+          const q = await db
+            .collection('users')
+            .where('emailLower', '==', emailLower)
+            .limit(1)
+            .get();
+          docSnap = q.empty ? null : q.docs[0];
+        }
+
+        const user = docSnap ? shapeUserDoc(docSnap) : null;
+        return res.json({ ok: true, user });
       }
 
-      const user = docSnap ? shapeUserDoc(docSnap) : null;
-      return res.json({ ok: true, user });
+      // No filter: return a page of users (adjust limit/order as needed)
+      const listSnap = await db.collection('users').limit(200).get();
+      const items = listSnap.docs.map(shapeUserDoc).filter(Boolean);
+      return res.json({ ok: true, items });
+    } catch (e) {
+      return res
+        .status(400)
+        .json({ ok: false, error: e?.message || 'Failed to fetch users' });
     }
-
-    // No filter: return a page of users (adjust limit/order as needed)
-    const listSnap = await db.collection('users').limit(200).get();
-    const items = listSnap.docs.map(shapeUserDoc).filter(Boolean);
-    return res.json({ ok: true, items });
-  } catch (e) {
-    return res
-      .status(400)
-      .json({ ok: false, error: e?.message || 'Failed to fetch users' });
   }
-});
+);
 
 /* ============== Create/Update role by EMAIL (writes users/<uid>) ============== */
 
@@ -192,6 +221,26 @@ async function upsertRoleHandler(req, res) {
     const email = String(req.body.email).trim();
     const name = String(req.body?.name || '').trim();
     const role = normalizeRole(req.body?.role);
+
+    // ---- Current caller role checks (admin vs moderator) ----
+    const currentRole = getCurrentRole(req) || 'user';
+    const isAdmin = currentRole === 'admin';
+    const isModerator = currentRole === 'moderator';
+
+    if (!isAdmin && !isModerator) {
+      return res.status(403).json({
+        ok: false,
+        error: 'Only admin or moderator can set roles.',
+      });
+    }
+
+    // Moderators CANNOT assign the "admin" role
+    if (!isAdmin && role === 'admin') {
+      return res.status(403).json({
+        ok: false,
+        error: 'Only an admin can assign the "admin" role.',
+      });
+    }
 
     // Resolve UID from Auth; create user if not found
     let uid;
@@ -241,7 +290,7 @@ async function upsertRoleHandler(req, res) {
         email,
         emailLower,
         role, // keep role in document for listing UI
-        name: name || FieldValue.delete?.() || undefined,
+        name: name || (FieldValue.delete && FieldValue.delete()) || undefined,
         updatedAt: FieldValue.serverTimestamp(),
       },
       { merge: true }
@@ -261,12 +310,17 @@ async function upsertRoleHandler(req, res) {
   }
 }
 
-// Protect write endpoints — admin only
-router.post('/users', requireAuth, requireRole(['admin']), upsertRoleHandler);
+// Writes: admin + moderator (but moderator cannot assign admin)
+router.post(
+  '/users',
+  requireAuth,
+  requireRole(['admin', 'moderator']),
+  upsertRoleHandler
+);
 router.post(
   '/users/role',
   requireAuth,
-  requireRole(['admin']),
+  requireRole(['admin', 'moderator']),
   upsertRoleHandler
 );
 

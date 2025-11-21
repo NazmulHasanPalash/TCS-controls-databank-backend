@@ -1,28 +1,3 @@
-// auth-rbac.js
-// Role-based access control middleware for Express using Firebase Auth + Firestore.
-//
-// Exports:
-//   - requireAuth(req,res,next)
-//   - requireRole(allowedRoles)(req,res,next)
-//   - minRole(minRoleName)(req,res,next)   // e.g. minRole('new_register') / 'user' / 'associate' / 'operator' / 'moderator' / 'admin'
-//   - setUserRole(uid, role)
-//   - getUserRole(uid)
-//   - ROLE_ORDER
-//
-// Firestore schema (server-side via Admin SDK):
-//   Collection: users
-//   Doc ID: <uid>
-//   Fields:
-//     role: "new_register" | "user" | "associate" | "operator" | "moderator" | "admin"
-//     updatedAt: <number ms since epoch or Firestore Timestamp>
-//
-// Notes:
-//   * If a user doc or role is missing, default to "new_register" (lowest).
-//   * Requires firebase-admin to be initialized in ./firebase-admin.
-//   * If you want to read a token from a cookie, make sure your app uses cookie-parser:
-//       const cookieParser = require('cookie-parser');
-//       app.use(cookieParser());
-
 'use strict';
 
 const { admin } = require('./firebase-admin'); // Initialized Admin SDK
@@ -30,9 +5,27 @@ const db = admin.firestore();
 
 /** Display order (for reference/UI only). Lowest → Highest. */
 const ROLE_ORDER = [
+  // Lowest
   'new_register',
+
+  // Base user
   'user',
-  'associate',
+
+  // Onboarding / new roles (same level)
+  'new_sales',
+  'new_production',
+  'new_finance',
+  'new_hr',
+  'new_administrative',
+
+  // Regular / active roles (same level)
+  'sales',
+  'production',
+  'finance',
+  'hr',
+  'administrative',
+
+  // Elevated roles
   'operator',
   'moderator',
   'admin',
@@ -40,12 +33,28 @@ const ROLE_ORDER = [
 
 /** Comparable levels (higher number = higher privilege). */
 const ROLE_LEVEL = {
+  // Base roles
   new_register: 0,
   user: 1,
-  associate: 2,
-  operator: 3,
-  moderator: 4,
-  admin: 5,
+
+  // Onboarding / new roles (all same level)
+  new_sales: 2,
+  new_production: 2,
+  new_finance: 2,
+  new_hr: 2,
+  new_administrative: 2,
+
+  // Regular / active department roles (all same level, higher than onboarding)
+  sales: 3,
+  production: 3,
+  finance: 3,
+  hr: 3,
+  administrative: 3,
+
+  // Elevated roles
+  operator: 4,
+  moderator: 5,
+  admin: 6,
 };
 
 // Small in-memory cache to reduce Firestore reads
@@ -172,8 +181,9 @@ function requireRole(allowedRoles = []) {
 
 /**
  * minRole('new_register') → allows everyone (>= new_register).
- * minRole('user') → allows user, associate, operator, moderator, admin.
- * minRole('associate') → allows associate, operator, moderator, admin.
+ * minRole('user') → allows user, all new_* onboarding roles,
+ *                   all department roles (sales, production, finance, hr,
+ *                   administrative), plus operator, moderator, admin.
  * minRole('operator') → allows operator, moderator, admin.
  * minRole('moderator') → allows moderator, admin.
  * minRole('admin') → allows admin only.
